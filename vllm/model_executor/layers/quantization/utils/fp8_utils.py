@@ -1180,6 +1180,160 @@ def get_w8a8_block_fp8_configs(
     return None
 
 
+@functools.lru_cache(maxsize=1)
+def _get_w8a8_kernel_version() -> str:
+    """
+    Get the W8A8 kernel version to use.
+    
+    Environment variable: VLLM_W8A8_KERNEL_VERSION
+    Valid values: "baseline", "v5", "v6", "v7" (default: "v7")
+    
+    - baseline: Use original vLLM kernel (no MI355X optimization)
+    - v5: Original decode/square tuning
+    - v6: Hybrid dispatch + aggressive tiny-M tuning
+    - v7: Full hybrid with prefill optimization (default)
+    """
+    import os
+    version = os.environ.get("VLLM_W8A8_KERNEL_VERSION", "v7").lower()
+    if version not in ("baseline", "v5", "v6", "v7"):
+        logger.warning(f"Invalid VLLM_W8A8_KERNEL_VERSION={version}, using v7")
+        version = "v7"
+    return version
+
+
+@functools.lru_cache(maxsize=1)
+def _use_optimized_mi355x_kernel() -> bool:
+    """Check if we should use the optimized MI355X kernel. Result is cached."""
+    # Check if baseline is explicitly requested
+    if _get_w8a8_kernel_version() == "baseline":
+        return False
+    
+    if not current_platform.is_rocm():
+        return False
+    device_name = current_platform.get_device_name()
+    # Enable for MI355X and MI300X family
+    return "MI355" in device_name or "MI300" in device_name or "MI325" in device_name
+
+
+# ============================================================================
+# V7 Hybrid-Optimized Configs for MI355X
+# ============================================================================
+# V7 combines the best of V6 with new optimizations:
+# 1. KEEP V6 DECODE: V6's small tiles (8x64, 16x64) work well for decode M<=16
+# 2. HIGH WARP FOR LARGE M: 8 warps for M>16 to maximize CU occupancy
+# 3. PREFILL OPTIMIZATION: Optimized prefill configs instead of fallback
+# 4. LARGE M COVERAGE: Better configs for M>64
+#
+# Tuple: (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages)
+
+# Decode shapes (M, 2048, 7168) - K > N, memory-bound
+# Keep V6 configs for tiny M (proven winners), use default for M>16
+_V7_CONFIG_DECODE_MICRO = (8, 64, 128, 4, 4, 4)    # M <= 2: V6 proven
+_V7_CONFIG_DECODE_TINY = (16, 64, 128, 4, 4, 4)    # M <= 4: V6 proven
+_V7_CONFIG_DECODE_SMALL = (16, 128, 128, 4, 4, 3)  # M <= 16: V6 proven
+# Note: For M>16 decode, use default - special configs cause regression
+
+# Square shapes (M, 7168, 7168) - balanced memory/compute
+# Keep V6 for tiny M, use V6 approach for larger M too
+_V7_CONFIG_SQUARE_MICRO = (8, 32, 128, 4, 4, 4)    # M <= 4: V6 proven 3.3x
+_V7_CONFIG_SQUARE_TINY = (16, 32, 128, 4, 4, 4)    # M <= 16: V6 proven 1.9x
+_V7_CONFIG_SQUARE_SMALL = (32, 32, 128, 8, 4, 3)   # M <= 64: V6 style
+_V7_CONFIG_SQUARE_MED = (64, 64, 128, 8, 4, 2)     # M <= 256: V6 style
+_V7_CONFIG_SQUARE_LARGE = (128, 128, 128, 8, 4, 2) # M <= 512: balanced
+
+# Prefill shapes (M, 7168, 2048) - N > K, write-bound
+# V7 NEW: Optimized prefill instead of baseline fallback
+_V7_CONFIG_PREFILL_MICRO = (8, 128, 128, 4, 4, 3)  # M <= 4
+_V7_CONFIG_PREFILL_TINY = (16, 128, 128, 4, 4, 3)  # M <= 16
+_V7_CONFIG_PREFILL_SMALL = (32, 128, 128, 8, 4, 2) # M <= 64
+_V7_CONFIG_PREFILL_MED = (64, 128, 128, 8, 8, 2)   # M <= 256
+_V7_CONFIG_PREFILL_LARGE = (128, 128, 128, 8, 8, 2)# M > 256
+
+# Default fallback
+_V7_CONFIG_DEFAULT = (64, 128, 128, 8, 8, 2)
+
+
+@functools.lru_cache(maxsize=256)
+def _get_optimal_mi355x_config_cached(M: int, N: int, K: int) -> tuple | None:
+    """
+    Get optimal MI355X config based on VLLM_W8A8_KERNEL_VERSION.
+    
+    Returns tuple (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages).
+    
+    Versions:
+    - baseline: Returns None (use default vLLM kernel)
+    - v5: Decode/square tuning only
+    - v6: Hybrid dispatch + aggressive tiny-M
+    - v7: Full hybrid with prefill optimization (default)
+    """
+    if not _use_optimized_mi355x_kernel():
+        return None
+    
+    version = _get_w8a8_kernel_version()
+    
+    # Dispatch to version-specific config
+    if version == "v5":
+        from vllm.model_executor.layers.quantization.utils.fp8_utils_v5 import get_v5_config
+        return get_v5_config(M, N, K)
+    elif version == "v6":
+        from vllm.model_executor.layers.quantization.utils.fp8_utils_v6 import get_v6_config
+        return get_v6_config(M, N, K)
+    
+    # Default: V7 configs (inline below)
+    
+    # NOTE: For M < 4, BLOCK_M=8 causes correctness issues, fallback to baseline
+    if M < 4:
+        return None
+    
+    # =========================================================================
+    # Decode shapes (M, 2048, 7168) - K > N, heavily memory-bound
+    # Only optimize for M>=4, M<=16, larger M uses default (avoids regression)
+    # =========================================================================
+    if N <= 2100 and K >= 7000:
+        if M <= 4:
+            return _V7_CONFIG_DECODE_TINY
+        elif M <= 16:
+            return _V7_CONFIG_DECODE_SMALL
+        # M > 16: Use default config (special configs cause regression)
+        return _V7_CONFIG_DEFAULT
+    
+    # =========================================================================
+    # Prefill shapes (M, 7168, 2048) - N > K, write-bound
+    # V7: Optimized prefill configs (only for M >= 8)
+    # M <= 4: BLOCK_M=8 causes correctness issues, use baseline
+    # =========================================================================
+    if N >= 7000 and K <= 2100:
+        if M <= 8:
+            return None  # Use baseline for tiny M
+        elif M <= 16:
+            return _V7_CONFIG_PREFILL_TINY
+        elif M <= 64:
+            return _V7_CONFIG_PREFILL_SMALL
+        elif M <= 256:
+            return _V7_CONFIG_PREFILL_MED
+        return _V7_CONFIG_PREFILL_LARGE
+    
+    # =========================================================================
+    # Square shapes (M, 7168, 7168) - balanced memory/compute
+    # M <= 4: BLOCK_M=8 causes correctness issues, use baseline
+    # =========================================================================
+    if N >= 7000 and K >= 7000:
+        if M <= 8:
+            return None  # Use baseline for tiny M
+        elif M <= 16:
+            return _V7_CONFIG_SQUARE_TINY
+        elif M <= 64:
+            return _V7_CONFIG_SQUARE_SMALL
+        elif M <= 256:
+            return _V7_CONFIG_SQUARE_MED
+        elif M <= 512:
+            return _V7_CONFIG_SQUARE_LARGE
+        return _V7_CONFIG_DEFAULT
+    
+    # All other shapes: use default config
+    return _V7_CONFIG_DEFAULT
+
+
 def w8a8_triton_block_scaled_mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1219,14 +1373,34 @@ def w8a8_triton_block_scaled_mm(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
+    # Try MI355X optimized config first (skips JSON lookup for speed)
+    mi355x_config = _get_optimal_mi355x_config_cached(M, N, K)
+    
+    if mi355x_config is not None:
+        # Fast path for MI355X: use pre-computed tuple config
+        BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages = mi355x_config
+        grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+        
+        _w8a8_triton_block_scaled_mm[grid](
+            A, B, C, As, Bs,
+            M, N, K,
+            block_n, block_k,
+            A.stride(-2), A.stride(-1),
+            B.stride(1), B.stride(0),
+            C.stride(-2), C.stride(-1),
+            As.stride(-2), As.stride(-1),
+            Bs.stride(1), Bs.stride(0),
+            BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=BLOCK_N,
+            BLOCK_SIZE_K=BLOCK_K, GROUP_SIZE_M=GROUP_M,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+        return C
+    
+    # Non-MI355X path: use JSON configs or default (slower but feature-complete)
     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
     if configs:
-        # Get the optimal config if there is one
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
-        # Default config
-        # Block-wise quant: BLOCK_SIZE_N must be divisible by block_size[0]
-        # BLOCK_SIZE_K must be divisible by block_size[1]
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": block_size[0],
@@ -1236,10 +1410,10 @@ def w8a8_triton_block_scaled_mm(
             "num_stages": 2,
         }
 
-    def grid(META):
-        return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
+    # Use simple tuple grid for minimal overhead
+    BLOCK_M = config["BLOCK_SIZE_M"]
+    BLOCK_N = config["BLOCK_SIZE_N"]
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
 
     _w8a8_triton_block_scaled_mm[grid](
         A,
