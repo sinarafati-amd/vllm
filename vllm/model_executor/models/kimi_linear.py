@@ -13,6 +13,14 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+
+try:
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm,
+    )
+    _HAS_FUSED_AR_RMS = True
+except ImportError:
+    _HAS_FUSED_AR_RMS = False
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -26,8 +34,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateCopyFunc,
-    MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
@@ -171,7 +177,7 @@ class KimiMoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not _HAS_FUSED_AR_RMS:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -238,11 +244,13 @@ class KimiMLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
+        _fused_ar = _HAS_FUSED_AR_RMS and get_tensor_model_parallel_world_size() > 1
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=not _fused_ar,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -298,6 +306,8 @@ class KimiDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self._use_fused_ar_rms = _HAS_FUSED_AR_RMS and self.tp_size > 1
 
         self.is_moe = config.is_moe
 
@@ -346,6 +356,7 @@ class KimiDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=not self._use_fused_ar_rms,
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -364,6 +375,11 @@ class KimiDecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif self._use_fused_ar_rms:
+            hidden_states, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
+                hidden_states, residual,
+                self.input_layernorm.weight.data,
+                self.input_layernorm.variance_epsilon)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -376,7 +392,14 @@ class KimiDecoderLayer(nn.Module):
         hidden_states = attn_output
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self._use_fused_ar_rms:
+            hidden_states, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
+                hidden_states, residual,
+                self.post_attention_layernorm.weight.data,
+                self.post_attention_layernorm.variance_epsilon)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -506,7 +529,7 @@ class KimiLinearForCausalLM(
 
     def forward(
         self,
-        input_ids: torch.Tensor | None,
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -545,14 +568,6 @@ class KimiLinearForCausalLM(
             conv_kernel_size=hf_config.linear_attn_config["short_conv_kernel_size"],
             num_spec=num_spec,
         )
-
-    @classmethod
-    def get_mamba_state_copy_func(
-        cls,
-    ) -> tuple[
-        MambaStateCopyFunc, MambaStateCopyFunc, MambaStateCopyFunc, MambaStateCopyFunc
-    ]:
-        return MambaStateCopyFuncCalculator.kda_state_copy_func()
 
     def compute_logits(
         self,

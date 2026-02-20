@@ -52,11 +52,12 @@ class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
 
     # max_size: max supported allreduce size
+    # Increased from 8MB to 32MB to handle larger allreduce tensors on ROCm
     def __init__(
         self,
         group: ProcessGroup,
         device: int | str | torch.device,
-        max_size=8192 * 1024,
+        max_size=32 * 1024 * 1024,
         symm_mem_enabled=False,
     ) -> None:
         """

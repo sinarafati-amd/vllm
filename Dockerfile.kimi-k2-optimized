@@ -1,0 +1,44 @@
+# Kimi-K2-Thinking-MXFP4 RCCL + RMSNorm Optimization
+#
+# Reproduces the 46% throughput improvement on MI355X (TP=4).
+#
+# Build:
+#   docker build -f Dockerfile.kimi-k2-optimized -t vllm-kimi-k2-optimized .
+#
+# Run:
+#   docker run --device=/dev/kfd --device=/dev/dri \
+#     --group-add video --group-add render \
+#     --shm-size 128g --network host \
+#     -e HIP_VISIBLE_DEVICES=0,1,2,3 \
+#     -e VLLM_ROCM_USE_AITER=1 \
+#     -e VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
+#     -e VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB=128 \
+#     -v /data:/data \
+#     vllm-kimi-k2-optimized \
+#     vllm serve amd/Kimi-K2-Thinking-MXFP4 \
+#       --tensor-parallel-size 4 \
+#       --trust-remote-code \
+#       --max-model-len 9000 \
+#       --attention-backend ROCM_AITER_MLA \
+#       --block-size 1
+
+FROM rocm/vllm-private:mlperf_0.14_vllm
+
+# Phase 2A: Lower QuickAllReduce INT4 min thresholds (16MB -> 256KB)
+# Captures decode-phase tensors that previously fell through to slow RCCL.
+COPY vllm/distributed/device_communicators/quick_all_reduce.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/quick_all_reduce.py
+
+# Phase 2B: Increase CustomAllreduce max_size (8MB -> 32MB)
+# Handles larger tensors via custom_ar instead of falling back to RCCL.
+COPY vllm/distributed/device_communicators/custom_all_reduce.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/custom_all_reduce.py
+
+# Phase 2C: Fused allreduce + rmsnorm in KimiDecoderLayer
+# Uses AITER's HIP kernel to merge allreduce + residual_add + rmsnorm into one launch.
+COPY vllm/model_executor/models/kimi_linear.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/kimi_linear.py
+
+# Clear AITER JIT cache so fused kernels recompile cleanly
+RUN rm -rf /root/.cache/aiter /tmp/aiter_* 2>/dev/null || true
+
+# Required env vars (set at docker run time):
+#   VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+#   VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB=128
