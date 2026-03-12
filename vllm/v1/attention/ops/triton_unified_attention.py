@@ -27,8 +27,8 @@ def cdiv_fn(x, y):
 @triton.jit
 def apply_softcap(S, x):
     Sdiv = S / x
-    p1 = tl.exp(Sdiv)
-    p2 = tl.exp(-Sdiv)
+    p1 = tl.math.exp2(Sdiv)
+    p2 = tl.math.exp2(-Sdiv)
     return x * (p1 - p2) / (p1 + p2)
 
 
@@ -360,13 +360,14 @@ def kernel_unified_attention_2d(
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
         # P : (BLOCK_M, TILE_SIZE)
-        P = tl.exp(S - m_j[:, None])
+        RCP_LN2: tl.constexpr = 1.4426950408889634
+        P = tl.math.exp2((S - m_j[:, None]) * RCP_LN2)
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+        alpha = tl.math.exp2((M - m_j) * RCP_LN2)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -714,13 +715,14 @@ def kernel_unified_attention_3d(
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
         # P : (BLOCK_M, TILE_SIZE,)
-        P = tl.exp(S - m_j[:, None])
+        RCP_LN2: tl.constexpr = 1.4426950408889634
+        P = tl.math.exp2((S - m_j[:, None]) * RCP_LN2)
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+        alpha = tl.math.exp2((M - m_j) * RCP_LN2)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -815,7 +817,7 @@ def reduce_segments(
 
     # load and rescale segment exp sums
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
+    segm_expsum = segm_expsum * tl.math.exp2((segm_max - overall_max) * 1.4426950408889634)
     overall_expsum = tl.sum(segm_expsum)
 
     # load, rescale, and add segment attention outputs
@@ -831,7 +833,7 @@ def reduce_segments(
         mask=segm_mask[:, None] & dim_mask[None, :],
         other=0.0,
     )
-    segm_output *= tl.exp(segm_max - overall_max)[:, None]
+    segm_output *= tl.math.exp2((segm_max - overall_max) * 1.4426950408889634)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
