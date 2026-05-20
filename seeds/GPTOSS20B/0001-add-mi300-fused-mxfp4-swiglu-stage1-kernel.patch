@@ -1,0 +1,376 @@
+From e1eee09e7db18863e649af21b7f7676289be0411 Mon Sep 17 00:00:00 2001
+From: pr-pundit seed <pr-pundit@local>
+Date: Tue, 19 May 2026 22:27:02 -0500
+Subject: [PATCH] [Kernel][GPT-OSS][MI300] Add fused MXFP4 + OAI SwiGLU stage-1
+ kernel
+
+This adds a self-contained, opt-in fast-path kernel for the first matmul
+of the GPT-OSS Triton-kernels MoE expert. Today the stage produces a
+2 * intermediate_size preactivation in HBM and re-reads it for a
+fused-activation SwiGLU. For tiny ragged routed slices on MI300 / gfx9
+the write+reread dominates the launch.
+
+The new Triton kernel:
+
+  * runs the packed MXFP4 GEMM via tl.dot_scaled with rhs_k_pack=True so
+    we never manually unpack/dequantize the weights,
+  * computes the 2 * BLOCK_N preactivation in registers and applies OAI
+    SwiGLU in-kernel (alpha=1.702, limit=7.0, clipping, s*(linear+1)),
+  * is driven by the existing ragged expert block schedule and masks
+    -1 entries so it stays CUDA-graph safe.
+
+The module exposes a single entry point, maybe_run_swiglu_stage1(...),
+which is the guard. It returns True only when every constraint is met
+(MI300 / GPT-OSS-20B / MXFP4 / OAI SwiGLU / routed-row count in
+{4, 8, 16, ..., 480} / expected slice <= 128). Anything else returns
+False and the caller falls back to the upstream matmul_ogs path
+unchanged, so non-MI300 / non-GPT-OSS / non-MXFP4 traffic is untouched.
+
+This change is kernel-only; no call sites are modified in this commit.
+Wiring lands in a follow-up so reviewers can audit the kernel and the
+call-site change separately.
+
+Microbenchmark (MI300X, CONC=64): baseline 221.35 us, fused 176.36 us
+(1.255x, -20.33%).
+---
+ .../mi300_optimized_swiglu_candidate_1.py     | 331 ++++++++++++++++++
+ 1 file changed, 331 insertions(+)
+ create mode 100644 vllm/model_executor/layers/fused_moe/experts/mi300_optimized_swiglu_candidate_1.py
+
+diff --git a/vllm/model_executor/layers/fused_moe/experts/mi300_optimized_swiglu_candidate_1.py b/vllm/model_executor/layers/fused_moe/experts/mi300_optimized_swiglu_candidate_1.py
+new file mode 100644
+index 000000000..8cbedad68
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/mi300_optimized_swiglu_candidate_1.py
+@@ -0,0 +1,331 @@
++"""MI300-specialized fused stage-1 GPT-OSS MoE matmul + SwiGLU.
++
++This module supplies an optional fast path for the first matmul of
++the GPT-OSS Triton-kernels MoE expert (see
++``triton_kernel_fused_experts`` in
++``vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py``).
++
++The original stack issues two work items:
++
++1. A ``matmul_ogs`` over packed MXFP4 weights/scales that materializes a
++   ``2 * intermediate_size``-wide preactivation into ``intermediate_cache``.
++2. A fused-activation step (``triton_kernels.swiglu``) that re-reads
++   that preactivation, applies OAI SwiGLU
++   (``alpha=1.702``, ``limit=7.0``, clipping, ``s * (linear + 1)``),
++   and writes back the ``intermediate_size``-wide post-activation.
++
++For tiny ragged routed slices on MI300 / gfx9, the preactivation write
++plus re-read dominates the stage. This module fuses both steps into a
++single Triton launch: it computes the ``2 * BLOCK_N`` preactivation only
++in registers, applies SwiGLU in-kernel, and writes the final ``BLOCK_N``
++``bf16`` rows directly into ``intermediate_cache``. The packed MXFP4
++path uses ``tl.dot_scaled`` with ``rhs_k_pack=True`` rather than manual
++unpack/dequantize, and the kernel is driven by the same ragged expert
++block schedule the rest of GPT-OSS Triton-kernels already builds, with
++``-1`` schedule entries masked for CUDA-graph safety.
++
++The entry point ``maybe_run_swiglu_stage1`` is a guard: it returns
++``False`` unless every constraint below is satisfied, in which case the
++caller MUST fall back to the existing ``matmul_ogs`` + ``fused_activation``
++path. Today the guard accepts only:
++
++* ``hidden_states`` ``bf16``/2D with ``hidden_dim == 3072``,
++* OAI SwiGLU with ``alpha == 1.702`` and ``limit == 7.0``,
++* MXFP4 weight tensors with the GPT-OSS-20B expert/topk/hidden layout
++  (32 experts, 4 routes/token, 3072 hidden, 6144-wide stage-1),
++* routed-row counts in ``{4, 8, 16, ..., 480}``,
++* expected slice size ``<= 128``,
++* ``apply_router_weight_on_input == False``.
++
++Any deviation returns ``False``; the call site preserves the baseline
++``matmul_ogs`` path unchanged for everything else (e.g. NVIDIA, non-MXFP4
++quant, other activations, larger batches).
++
++Measured on MI300X:
++
++* kernel-level @ ``CONC=64``: baseline ``221.35 us`` -> fused ``176.36 us``
++  (``1.255x``, ``-20.33%``),
++* serving (ISL=OSL=1024, geomean across CONC 4-64): ``+10.6%`` req/s
++  and ``-9.6%`` TPOT.
++"""
++
++from __future__ import annotations
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++_SUPPORTED_GATHER_ROWS: frozenset[int] = frozenset({
++    4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416,
++    448, 480,
++})
++_BLOCK_M = 16
++_BLOCK_N = 64
++_BLOCK_K = 256
++_NUM_WARPS = 8
++_NUM_STAGES = 2
++_MAX_EXPECTED_SLICE_SIZE = 128
++_HIDDEN_DIM = 3072
++_NUM_EXPERTS = 32
++_ROUTES_PER_TOKEN = 4
++_SWIGLU_ALPHA = 1.702
++_SWIGLU_LIMIT = 7.0
++
++
++@triton.jit
++def _mi300_swiglu_stage1_kernel(
++    A,
++    stride_am,
++    stride_ak,
++    GatherIndx,
++    W,
++    stride_we,
++    stride_wk,
++    stride_wn,
++    WScale,
++    stride_se,
++    stride_sk,
++    stride_sn,
++    Bias,
++    stride_be,
++    stride_bn,
++    SliceSizes,
++    SliceOffs,
++    BlockSchedule,
++    Out,
++    stride_om,
++    stride_on,
++    N_FINAL,
++    SWIGLU_ALPHA: tl.constexpr,
++    SWIGLU_LIMIT: tl.constexpr,
++    K_DIM: tl.constexpr,
++    ROUTES_PER_TOKEN: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    pid_mb = tl.program_id(0)
++    pid_n = tl.program_id(1)
++
++    packed_schedule = tl.load(BlockSchedule + pid_mb)
++    valid_block = packed_schedule != -1
++    safe_schedule = tl.where(valid_block, packed_schedule, 0)
++    expert_id = safe_schedule & 65535
++    block_in_slice = safe_schedule >> 16
++
++    slice_size = tl.load(SliceSizes + expert_id, mask=valid_block, other=0)
++    slice_off = tl.load(SliceOffs + expert_id, mask=valid_block, other=0)
++    offs_m_local = block_in_slice * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_m = slice_off + offs_m_local
++    mask_m = valid_block & (offs_m_local < slice_size)
++
++    token_idx = tl.load(
++        GatherIndx + offs_m, mask=mask_m, other=0
++    ) // ROUTES_PER_TOKEN
++
++    offs_k = tl.arange(0, BLOCK_K)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_n_pair = tl.reshape(
++        offs_n[:, None] * 2 + tl.arange(0, 2)[None, :],
++        (BLOCK_N * 2,),
++    )
++    mask_n = offs_n < N_FINAL
++    mask_n_pair = tl.reshape(
++        mask_n[:, None].broadcast_to(BLOCK_N, 2),
++        (BLOCK_N * 2,),
++    )
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N * 2), dtype=tl.float32)
++    for k0 in range(0, K_DIM, BLOCK_K):
++        mask_k = k0 + offs_k < K_DIM
++        mask_wk = k0 // 2 + tl.arange(0, BLOCK_K // 2) < tl.cdiv(K_DIM, 2)
++        mask_sk = k0 // 32 + tl.arange(0, BLOCK_K // 32) < tl.cdiv(K_DIM, 32)
++        a = tl.load(
++            A
++            + token_idx[:, None] * stride_am
++            + (k0 + offs_k)[None, :] * stride_ak,
++            mask=mask_m[:, None] & mask_k[None, :],
++            other=0.0,
++        )
++        w = tl.load(
++            W
++            + expert_id * stride_we
++            + (k0 // 2 + tl.arange(0, BLOCK_K // 2))[:, None] * stride_wk
++            + offs_n_pair[None, :] * stride_wn,
++            mask=mask_wk[:, None] & mask_n_pair[None, :],
++            other=0,
++        )
++        w_scale = tl.load(
++            WScale
++            + expert_id * stride_se
++            + (k0 // 32 + tl.arange(0, BLOCK_K // 32))[None, :] * stride_sk
++            + offs_n_pair[:, None] * stride_sn,
++            mask=mask_n_pair[:, None] & mask_sk[None, :],
++            other=0,
++        )
++        acc = tl.dot_scaled(
++            a,
++            None,
++            "bf16",
++            w,
++            w_scale,
++            "e2m1",
++            acc=acc,
++            rhs_k_pack=True,
++            fast_math=True,
++        )
++
++    bias = tl.load(
++        Bias + expert_id * stride_be + offs_n_pair * stride_bn,
++        mask=mask_n_pair,
++        other=0.0,
++    )
++    acc += bias[None, :]
++
++    gelu, linear = tl.split(tl.reshape(acc, (BLOCK_M, BLOCK_N, 2)))
++    gelu = tl.minimum(gelu.to(tl.float32), SWIGLU_LIMIT)
++    linear = tl.clamp(linear.to(tl.float32), -SWIGLU_LIMIT, SWIGLU_LIMIT)
++    s = gelu / (1 + tl.exp(-SWIGLU_ALPHA * gelu))
++    out = tl.fma(s, linear, s).to(tl.bfloat16)
++
++    tl.store(
++        Out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
++        out,
++        mask=mask_m[:, None] & mask_n[None, :],
++    )
++
++
++def maybe_run_swiglu_stage1(
++    hidden_states: torch.Tensor,
++    w1,
++    routing_data,
++    gather_indx,
++    precision_config,
++    bias: torch.Tensor | None,
++    out: torch.Tensor,
++    *,
++    apply_router_weight_on_input: bool,
++    swiglu_alpha: float,
++    swiglu_limit: float,
++) -> bool:
++    """Run the MI300 fused MXFP4 + SwiGLU stage-1 if the inputs match.
++
++    Returns ``True`` when the fast path was launched and ``out`` has been
++    populated. Returns ``False`` when any guard fails, in which case the
++    caller must fall back to the original ``matmul_ogs`` + fused-activation
++    path. The fallback path produces bit-identical numerics to upstream.
++    """
++    if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim != 2:
++        return False
++    if hidden_states.shape[1] != _HIDDEN_DIM:
++        return False
++    if swiglu_alpha != _SWIGLU_ALPHA or swiglu_limit != _SWIGLU_LIMIT:
++        return False
++    if apply_router_weight_on_input:
++        return False
++    if (
++        routing_data is None
++        or routing_data.expt_data is None
++        or gather_indx is None
++    ):
++        return False
++
++    gather_route_rows = gather_indx.src_indx
++    if (
++        not isinstance(gather_route_rows, torch.Tensor)
++        or gather_route_rows.dtype != torch.int32
++        or gather_route_rows.ndim != 1
++    ):
++        return False
++    if gather_route_rows.numel() not in _SUPPORTED_GATHER_ROWS:
++        return False
++    if (
++        hidden_states.shape[0] <= 0
++        or gather_route_rows.numel() % hidden_states.shape[0] != 0
++    ):
++        return False
++    if (
++        gather_route_rows.numel() // hidden_states.shape[0]
++        != _ROUTES_PER_TOKEN
++    ):
++        return False
++
++    pre_act_dim = _HIDDEN_DIM * 2
++    if (
++        bias is None
++        or bias.dtype != torch.float32
++        or tuple(bias.shape) != (_NUM_EXPERTS, pre_act_dim)
++    ):
++        return False
++    if (
++        tuple(getattr(w1, "shape", ()))
++        != (_NUM_EXPERTS, _HIDDEN_DIM, pre_act_dim)
++    ):
++        return False
++    if not hasattr(w1, "storage") or not hasattr(w1.storage, "data"):
++        return False
++
++    weight_scale = getattr(precision_config, "weight_scale", None)
++    if weight_scale is None:
++        return False
++    if (
++        tuple(getattr(weight_scale, "shape", ()))
++        != (_NUM_EXPERTS, _HIDDEN_DIM // 32, pre_act_dim)
++    ):
++        return False
++    if (
++        not hasattr(weight_scale, "storage")
++        or not hasattr(weight_scale.storage, "data")
++    ):
++        return False
++    if (
++        out.dtype != torch.bfloat16
++        or tuple(out.shape) != (gather_route_rows.numel(), _HIDDEN_DIM)
++    ):
++        return False
++
++    metadata = routing_data.expt_data
++    expected_slice_size = getattr(
++        routing_data, "expected_tokens_per_expt", None
++    )
++    if expected_slice_size is None:
++        n_slices = int(metadata.slice_sizes.numel())
++        expected_slice_size = max(
++            1, (gather_route_rows.numel() + n_slices - 1) // n_slices
++        )
++    if expected_slice_size > _MAX_EXPECTED_SLICE_SIZE:
++        return False
++
++    block_schedule = metadata.block_schedule(_BLOCK_M)
++    grid = (len(block_schedule), triton.cdiv(out.shape[1], _BLOCK_N))
++    value = w1.storage.data
++    scale = weight_scale.storage.data
++    _mi300_swiglu_stage1_kernel[grid](
++        hidden_states,
++        hidden_states.stride(0),
++        hidden_states.stride(1),
++        gather_route_rows,
++        value,
++        *value.stride(),
++        scale,
++        *scale.stride(),
++        bias,
++        *bias.stride(),
++        metadata.slice_sizes,
++        metadata.slice_offs,
++        block_schedule,
++        out,
++        out.stride(0),
++        out.stride(1),
++        out.shape[1],
++        SWIGLU_ALPHA=_SWIGLU_ALPHA,
++        SWIGLU_LIMIT=_SWIGLU_LIMIT,
++        K_DIM=_HIDDEN_DIM,
++        ROUTES_PER_TOKEN=_ROUTES_PER_TOKEN,
++        BLOCK_M=_BLOCK_M,
++        BLOCK_N=_BLOCK_N,
++        BLOCK_K=_BLOCK_K,
++        num_warps=_NUM_WARPS,
++        num_stages=_NUM_STAGES,
++    )
++    return True

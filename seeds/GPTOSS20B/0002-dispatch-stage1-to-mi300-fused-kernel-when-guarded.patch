@@ -1,0 +1,98 @@
+From 68a9b5c85b34bad5c3bb1c56e2ce582fa1e7ff0d Mon Sep 17 00:00:00 2001
+From: pr-pundit seed <pr-pundit@local>
+Date: Tue, 19 May 2026 22:27:40 -0500
+Subject: [PATCH] [GPT-OSS][MI300] Dispatch stage-1 to fused MXFP4 + SwiGLU
+ kernel when guarded
+
+Wire the new `maybe_run_swiglu_stage1` guard from
+`mi300_optimized_swiglu_candidate_1` in front of the existing stage-1
+`matmul_ogs` + `fused_activation` call in
+`triton_kernel_fused_experts`.
+
+Behavior:
+
+  * The guard returns True iff: device-shape MoE matches GPT-OSS-20B
+    (32 experts / topk=4 / hidden=3072 / pre-act=6144), the weights are
+    MXFP4 with the expected packed layout, the activation is OAI SwiGLU
+    with alpha=1.702 and limit=7.0, `apply_router_weight_on_input` is
+    False, the routed row count is one of {4, 8, 16, ..., 480}, and the
+    expected per-expert slice is <= 128. In that case the fused kernel
+    writes the post-activation `(M*topk, N//2)` view of
+    `intermediate_cache` directly.
+  * Otherwise the guard returns False and we run the original
+    `matmul_ogs` + `fused_activation` path with no change in
+    numerics, so non-MI300 / non-GPT-OSS / non-MXFP4 / OAI-SwiGLU-with-
+    different-params traffic is bit-identical to upstream.
+
+Stage 2 (`matmul_ogs` into `output_tensor`) is untouched.
+
+End-to-end results on MI300X (ISL=OSL=1024, geomean across CONC 4-64,
+5 independent runs per cell):
+
+  | metric          | delta   |
+  |-----------------|---------|
+  | req/s, tok/s    | +10.6 % |
+  | interactivity   | +10.6 % |
+  | TPOT            |  -9.6 % |
+---
+ .../experts/gpt_oss_triton_kernels_moe.py     | 35 +++++++++++++++----
+ 1 file changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py b/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py
+index a7c5bd1c5..6d815dd12 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py
+@@ -30,6 +30,7 @@ from vllm.triton_utils import tl, triton
+ from vllm.utils.import_utils import has_triton_kernels
+ 
+ from ..utils import swiglu_limit_func
++from .mi300_optimized_swiglu_candidate_1 import maybe_run_swiglu_stage1
+ 
+ logger = init_logger(__name__)
+ 
+@@ -441,18 +442,38 @@ def triton_kernel_fused_experts(
+     )
+     gammas = routing_data.gate_scal if routing_data else None
+ 
+-    matmul_ogs(
++    # MI300 / gfx9 fast path: fused MXFP4 GEMM + OAI SwiGLU into the
++    # intermediate cache. The guard inside ``maybe_run_swiglu_stage1``
++    # returns False unless every shape / dtype / quant / activation /
++    # routed-row guard matches; in that case we fall through to the
++    # generic ``matmul_ogs`` + ``fused_activation`` path below with no
++    # change in numerics for non-supported configurations.
++    used_mi300_swiglu_stage1 = maybe_run_swiglu_stage1(
+         hidden_states,
+         w1,
+-        quant_config.w1_bias,
+         routing_data,
+-        gather_indx=gather_indx,
+-        precision_config=quant_config.w1_precision,
+-        gammas=gammas if apply_router_weight_on_input else None,
+-        fused_activation=act,
+-        y=intermediate_cache,
++        gather_indx,
++        quant_config.w1_precision,
++        quant_config.w1_bias,
++        intermediate_cache.view(M * topk, N // 2),
++        apply_router_weight_on_input=apply_router_weight_on_input,
++        swiglu_alpha=swiglu_alpha,
++        swiglu_limit=swiglu_limit,
+     )
+ 
++    if not used_mi300_swiglu_stage1:
++        matmul_ogs(
++            hidden_states,
++            w1,
++            quant_config.w1_bias,
++            routing_data,
++            gather_indx=gather_indx,
++            precision_config=quant_config.w1_precision,
++            gammas=gammas if apply_router_weight_on_input else None,
++            fused_activation=act,
++            y=intermediate_cache,
++        )
++
+     matmul_ogs(
+         intermediate_cache.view(M * topk, N // 2),
+         w2,
