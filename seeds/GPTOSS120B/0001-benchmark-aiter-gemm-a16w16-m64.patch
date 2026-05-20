@@ -1,9 +1,9 @@
 diff --git a/benchmarks/kernels/benchmark_aiter_gemm_a16w16_m64.py b/benchmarks/kernels/benchmark_aiter_gemm_a16w16_m64.py
 new file mode 100644
-index 000000000..b8bdb92e8
+index 000000000..057dce2af
 --- /dev/null
 +++ b/benchmarks/kernels/benchmark_aiter_gemm_a16w16_m64.py
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,116 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Microbenchmark for the aiter Triton ``gemm_a16w16`` path that vLLM uses
@@ -75,9 +75,13 @@ index 000000000..b8bdb92e8
 +    device = torch.device("cuda")
 +
 +    for label, m, n, k in SHAPES:
-+        a = torch.randn((n, k), dtype=dtype, device=device)
-+        b = torch.randn((m, k), dtype=dtype, device=device)
-+        ref = lambda a=a, b=b: torch.nn.functional.linear(a, b)
++        # Activation has shape (M, K); weight has shape (N, K) so that
++        # torch.nn.functional.linear(x, w) returns (M, N). This matches the
++        # call sites in vllm/model_executor/layers/utils.py where x is the
++        # decode-time activation and weight is the projection weight.
++        x = torch.randn((m, k), dtype=dtype, device=device)
++        w = torch.randn((n, k), dtype=dtype, device=device)
++        ref = lambda x=x, w=w: torch.nn.functional.linear(x, w)
 +        print(f"shape={label} M={m} N={n} K={k} dtype={args.dtype}")
 +        ref_ms = _bench(ref, args.warmup, args.iters)
 +        print(_row("torch.linear", m, n, k, ref_ms))
@@ -86,7 +90,7 @@ index 000000000..b8bdb92e8
 +            print("  aiter.gemm_a16w16  not installed; skipping")
 +            continue
 +
-+        gemm = lambda a=a, b=b: aiter_gemm_a16w16(a, b, None)
++        gemm = lambda x=x, w=w: aiter_gemm_a16w16(x, w, None)
 +        # Warmup with a single call to surface compile errors early.
 +        try:
 +            gemm()
