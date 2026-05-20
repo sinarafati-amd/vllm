@@ -1,0 +1,24 @@
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index 8bab7055e..cc6d69902 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -99,10 +99,18 @@ def default_unquantized_gemm(
+ 
+ 
+ def use_aiter_triton_gemm(n, m, k, dtype):
++    # Imported lazily so non-ROCm builds do not pay for this dispatch.
++    from vllm.platforms.rocm import on_gfx950
++
+     if (
+         not rocm_aiter_ops.is_triton_gemm_enabled()
+-        # MI300's - fp8nuz=True
++        # MI300 (gfx942) uses fp8 fnuz; the Triton GEMM here targets CDNA4.
+         or current_platform.is_fp8_fnuz()
++        # The Gluon specialization in aiter.gemm_a16w16 uses gfx950-only
++        # CDNA4 intrinsics (e.g. amd.cdna4.async_copy). Other ROCm arches
++        # would either fall back to a slower path or crash at compile time,
++        # so we only dispatch to it when we know we are on gfx950.
++        or not on_gfx950()
+         or dtype not in [torch.float16, torch.bfloat16]
+     ):
+         return False
